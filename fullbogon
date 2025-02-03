@@ -1,0 +1,122 @@
+import requests
+from ncclient import manager
+from nornir import InitNornir
+from nornir.core.filter import F
+from nornir.core.task import Task, Result
+
+#Function to fetch prefixes from Team Cymru's bogon list
+def fetch_bogon_prefixes():
+    url = "https://team-cymru.org/Services/Bogons/fullbogons-ipv4.txt"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+
+
+        prefixes = [line.strip() for line in response.text.splitlines() if line and not line.startswith('#')]
+
+        print(f"Fetched {len(prefixes)} bogon prefixes.")
+        return prefixes
+
+    except requests.RequestException as e:
+        print(f"Error fetching bogon prefixes: {e}")
+        return []
+
+#yang structure
+def delete_bogon_prefix_rpc():
+    config = """
+    <config>
+      <configuration>
+        <policy-options>
+          <prefix-list operation="delete">
+            <name>cymru-bogon-v4-prefixes</name>
+          </prefix-list>
+        </policy-options>
+      </configuration>
+    </config>
+    """
+    return config
+
+# NETCONF RPC template for adding bogon prefixes
+def create_bogon_prefix_rpc(prefixes):
+    config = """
+    <config>
+      <configuration>
+        <policy-options>
+          <prefix-list>
+            <name>cymru-bogon-v4-prefixes</name>
+    """
+    for prefix in prefixes:
+        config += f"<prefix-list-item><name>{prefix}</name></prefix-list-item>"
+    config += """
+          </prefix-list>
+        </policy-options>
+      </configuration>
+    </config>
+    """
+    return config
+
+# NETCONF operation to manage bogon prefix list
+def manage_bogon_prefix_list(task: Task, prefixes):
+    host = task.host.hostname
+    port = task.host.get("port", 830)
+    username = task.host.username
+    password = task.host.password
+
+    try:
+        print(f"Connecting to {host} via NETCONF...")
+        with manager.connect(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            hostkey_verify=False,
+            device_params={'name': 'junos'},
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=30
+        ) as m:
+
+            # Attempt to delete existing bogon prefix list
+            delete_rpc = delete_bogon_prefix_rpc()
+            print(f"Checking and deleting existing 'cymru-bogon-v4-prefixes' on {host} if present...")
+            try:
+                m.edit_config(target='candidate', config=delete_rpc)
+                m.commit()
+                print(f"Successfully deleted existing prefix list on {host}.")
+            except Exception as delete_error:
+                print(f"No existing prefix list found on {host}, skipping delete.")
+
+            # Add new bogon prefix list
+            bogon_prefix_rpc = create_bogon_prefix_rpc(prefixes)
+            print(f"Applying new 'cymru-bogon-v4-prefixes' on {host}...")
+            m.edit_config(target='candidate', config=bogon_prefix_rpc)
+
+            # Commit the changes
+            print(f"Committing changes on {host}...")
+            m.commit()
+
+            print(f"Successfully updated bogon prefixes on {host}.")
+
+            return Result(host=task.host, result="Success")
+
+    except Exception as e:
+        print(f"Error managing bogon prefixes on {host}: {e}")
+        return Result(host=task.host, failed=True, result=str(e))
+
+
+def main():
+    
+    nr = InitNornir(config_file="/home/dco/nms/nornir/config.yaml")
+
+
+    devices = nr.filter(F(groups__contains="ld5-dfz"))
+
+   
+    bogon_prefixes = fetch_bogon_prefixes()
+
+    result = devices.run(task=manage_bogon_prefix_list, prefixes=bogon_prefixes)
+
+    print(result)
+
+if __name__ == "__main__":
+    main()
